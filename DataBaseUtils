@@ -28,7 +28,7 @@ import java.util.Date;
 import java.util.stream.Collectors;
 
 /**
- * 扫描配置数据库迁移工具
+ * 数据库迁移工具
  *
  * @author Brian
  * @date 2022/9/19 3:58 PM
