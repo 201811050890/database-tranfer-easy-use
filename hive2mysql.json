@@ -1,0 +1,19 @@
+{
+  "hive":"mysql",
+  "BIGINT":"bigint",
+  "decimal":"decimal",
+  "DOUBLE":"double",
+  "BINARY":"varbinary",
+  "STRING":"text",
+  "date":"date",
+  "MAP":"json",
+  "INT":"int",
+  "tinyint":"tinyint",
+  "smallint":"smallint",
+  "float":"float",
+  "decimal":"decimal",
+  "varbinary":"varbinary",
+  "date":"date",
+  "char":"char",
+  "varchar":"varchar"
+}
