@@ -1,0 +1,662 @@
+import cn.hutool.core.date.DateTime;
+import cn.hutool.core.date.DateUtil;
+import com.alibaba.druid.util.JdbcUtils;
+import com.alibaba.fastjson.JSONObject;
+import com.yeexun.scdl.ScdlApplication;
+import com.yeexun.scdl.common.bean.BeanUtils;
+import com.yeexun.scdl.entity.scan.JDBCInfo;
+import com.yeexun.scdl.entity.scan.JdbcParseUser;
+import com.yeexun.scdl.entity.scan.JdbcVO;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.stereotype.Component;
+
+import javax.sql.DataSource;
+import java.io.IOException;
+import java.io.Serializable;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.*;
+import java.util.*;
+import java.util.Date;
+import java.util.stream.Collectors;
+
+/**
+ * 扫描配置数据库迁移工具
+ *
+ * @author Brian
+ * @date 2022/9/19 3:58 PM
+ */
+@Component
+@Slf4j
+public class DatabaseUtils {
+    /**
+     * 本系统MySQL配置信息
+     */
+    @Value("${mysql.url}")
+    public String sysUrl;
+    @Value("${mysql.driver-class-name}")
+    public String sysDriver;
+    @Value("${mysql.user}")
+    public String sysUsername;
+    @Value("${mysql.password}")
+    public String sysPassword;
+
+    /**
+     * pg与MySQL字段类型对应。文件与Map
+     */
+    private final String PG_2_MYSQL_FILENAME = "scan/pg2mysql.json";
+    private  Map<String, String> pg2Mysql = new HashMap<String, String>();
+
+    /**
+     * 数据库账户、密码配置文件地址文件名
+     */
+    private final static String DB_USER_PASS_FILENAME = "scan/jdbc-user-password.json";
+
+
+    /**
+     * hive与MySQL字段类型对应。文件与Map
+     */
+    private final String HIVE_2_MYSQL_FILENAME = "scan/hive2mysql.json";
+    private Map<String, String> hive2Mysql = new HashMap<>();
+
+    /**
+     * 代码块-加载字段对应
+     */
+    {
+        ClassLoader classLoader = ScdlApplication.class.getClassLoader();
+        URL resource = classLoader.getResource(PG_2_MYSQL_FILENAME);
+        URL resourceHive = classLoader.getResource(HIVE_2_MYSQL_FILENAME);
+        Path path = null;
+        try {
+            path = Paths.get(resource.toURI());
+            List<String> fileString = Files.readAllLines(path);
+            StringBuilder sb = new StringBuilder();
+            for (String s:
+                    fileString) {
+                sb.append(s);
+            }
+            pg2Mysql = JSONObject.parseObject(sb.toString(), Map.class);
+
+            Path pathHive = Paths.get(resourceHive.toURI());
+            List<String> fileStringHive = Files.readAllLines(pathHive);
+            StringBuilder hiveStrings = new StringBuilder();
+            for (String s:
+                    fileStringHive) {
+                hiveStrings.append(s);
+            }
+            hive2Mysql = JSONObject.parseObject(hiveStrings.toString(), Map.class);
+
+
+        } catch (URISyntaxException | IOException e) {
+            log.error("{}", e.getMessage());
+        }
+
+
+    }
+
+    /**
+     * 数据库建表
+     * 本机对应数据库，数据库信息来自yml配置
+     * @param createSql 创建sql
+     */
+    public void createTable(String createSql){
+        JDBCInfo jdbcInfo = new JDBCInfo();
+        jdbcInfo.setDriverClassName(sysDriver);
+        jdbcInfo.setUrl(sysUrl);
+        jdbcInfo.setUser(sysUsername);
+        jdbcInfo.setPassword(sysPassword);
+        DataSource dataSource = getDataSource(jdbcInfo);
+        JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
+        jdbcTemplate.execute(createSql);
+    }
+
+    /**
+     *
+     * 根据不同类型数据库，获取建表语句
+     *
+     * @param jdbcInfo jdbc信息
+     * @return {@link String}
+     */
+    public String getDdl(JDBCInfo jdbcInfo){
+
+        DataSource dataSource = getDataSource(jdbcInfo);
+        String createTable = null;
+        if ("mysql".equalsIgnoreCase(jdbcInfo.getType())) {
+            String sql = "SHOW CREATE TABLE " + jdbcInfo.getTableName();
+            JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
+            Map<String, Object> map = jdbcTemplate.queryForMap(sql);
+            createTable = (String) map.get("Create Table");
+        }
+        else if ("pg".equalsIgnoreCase(jdbcInfo.getType())){
+            List<String> columnList = new ArrayList<>();
+            Connection connection = null;
+            String tableRemark = null;
+            try {
+                connection = dataSource.getConnection();
+                TableMetadata tableMetadata = getTableMetadata(connection, jdbcInfo);
+                columnList = getColumnList(connection, jdbcInfo, tableMetadata.getPks(), pg2Mysql);
+                tableRemark = tableMetadata.getTableRemark();
+
+            } catch (SQLException e) {
+                e.printStackTrace();
+            }finally {
+                // 关闭连接
+                JdbcUtils.close(connection);
+            }
+            createTable = createDdlString(columnList, tableRemark, jdbcInfo);
+
+        }else if ("hive".equalsIgnoreCase(jdbcInfo.getType())){
+            List<String> columnList = new ArrayList<>();
+            Connection connection = null;
+            String tableRemark = null;
+            try {
+                connection = dataSource.getConnection();
+                TableMetadata tableMetadata = getTableMetadata(connection, jdbcInfo);
+                System.out.println(tableMetadata);
+                columnList = getColumnList(connection, jdbcInfo, tableMetadata.getPks(), hive2Mysql);
+                System.out.println(JSONObject.toJSONString(columnList));
+                tableRemark = tableMetadata.getTableRemark();
+
+            } catch (SQLException e) {
+                e.printStackTrace();
+            }finally {
+                // 关闭连接
+                JdbcUtils.close(connection);
+            }
+            createTable = createDdlString(columnList, tableRemark, jdbcInfo);
+        }
+
+        return createTable;
+
+    }
+
+    /**
+     * 创建ddl语句
+     *
+     * @param columnList  列清单
+     * @param tableRemark 表注释
+     * @param jdbcInfo    jdbc信息
+     * @return {@link String}
+     */
+    private String createDdlString(List<String> columnList, String tableRemark, JDBCInfo jdbcInfo) {
+        StringBuilder ddlSb = new StringBuilder("CREATE TABLE ");
+        ddlSb.append(jdbcInfo.getTableName()).append("("); // CREATE TABLE t1(
+
+        System.out.println(JSONObject.toJSONString(columnList));
+        columnList.forEach(item -> ddlSb.append(item).append(",")
+        ); // CREATE TABLE t1( id INT ......,
+
+
+        // 去除最后一个逗号 ,
+        ddlSb.deleteCharAt(ddlSb.lastIndexOf(","));
+        ddlSb.append(")");
+        // 加上表注释
+        tableRemark = tableRemark == null ? ";" : " COMMENT=\""+ tableRemark + "\";";
+        ddlSb.append(tableRemark);
+        return ddlSb.toString();
+    }
+
+    /**
+     * 转移更新
+     *
+     * @param jdbcInfo jdbc信息
+     * @param jdbcVO   jdbc签证官
+     */
+    public void transferUpdate(JDBCInfo jdbcInfo, JdbcVO jdbcVO) {
+        // 全量更新 -- replace
+        if (jdbcVO.getUpdateAll() == 1){
+            this.transferAllData(jdbcInfo);
+            return;
+        }
+        // 增量更新
+        String updateColumnDependency = jdbcVO.getUpdateColumnDependency();
+        Date date = new Date();
+        DateTime dateTime = DateUtil.offsetHour(date, -6);
+        // sql -> 获取对应表的时间字段，在当前时间点6小时之前的数据。
+        String sql =
+                "SELECT * FROM " + jdbcVO.getTableName() +
+                        " WHERE " + updateColumnDependency  + " > ? ";
+
+        DataSource dataSource = null;
+        DataSource localDataSource = null;
+
+        dataSource = getDataSource(jdbcInfo);
+        JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
+        List<Map<String, Object>> resourceList = jdbcTemplate.queryForList(sql, dateTime);
+
+        localDataSource = getLocalDataSource();
+        // 批量新增
+        String updateSql = "REPLACE INTO " + jdbcVO.getTableName() + " values (";
+        ParamAndSql pas = createSaveSql(updateSql, resourceList);
+        JdbcTemplate localJdbcTemplate = new JdbcTemplate(localDataSource);
+        localJdbcTemplate.batchUpdate(pas.getSql(), pas.getParam());
+
+    }
+
+  
+
+
+    /**
+     * 表元数据类
+     */
+    @Data
+    public static class TableMetadata{
+        // 1、存主键信息
+        Set<String> pks = new HashSet<>();
+        // 2、存表注释
+        String tableRemark = null;
+    }
+
+
+    /**
+     * 获取表元数据信息
+     *
+     * @param connection 连接
+     * @param jdbcInfo   jdbc信息
+     * @return {@link TableMetadata}
+     */
+    public TableMetadata getTableMetadata(Connection connection, JDBCInfo jdbcInfo){
+
+        ResultSet primaryKeys = null;
+        String tableRemark = null;
+        Set<String> pks = new HashSet<>();
+        try {
+            // 获取主键
+            primaryKeys = connection.getMetaData().getPrimaryKeys(null, jdbcInfo.getSchema(), jdbcInfo.getTableName());
+            while (primaryKeys.next()){
+                String string = primaryKeys.getString(4);
+                pks.add(string);
+            }
+            // 获取表注释
+            ResultSet tables = connection.getMetaData().getTables(null, jdbcInfo.getSchema(), jdbcInfo.getTableName(), null);
+            while (tables.next()){
+                tableRemark = tables.getString("REMARKS");
+            }
+        } catch (SQLException e) {
+            log.error("{}——{}", "数据读取异常", e.getMessage());
+        }finally {
+            try {
+                if (primaryKeys != null) {
+                    primaryKeys.close();
+                }
+            } catch (SQLException e) {
+                log.error("{}——{}", "表ResultSet连接关闭异常", e.getMessage());
+            }
+
+        }
+        TableMetadata tableMetadata = new TableMetadata();
+        tableMetadata.setTableRemark(tableRemark);
+        tableMetadata.setPks(pks);
+        return tableMetadata;
+    }
+
+    /**
+     * 获取 适配MySQL的字段创建语句 【源->MySQL】
+     *
+     * @param jdbcInfo   jdbc信息
+     * @param pks        当前表主键信息
+     * @param connection 连接
+     * @param map        源库字段类型 与 MySQL 字段类型对应。 {源,MySQL}
+     * @return {@link List}<{@link String}>
+     */
+    public List<String> getColumnList(Connection connection, JDBCInfo jdbcInfo, Set<String> pks, Map<String, String> map) {
+        List<String> columnList = new ArrayList<>();
+        ResultSet rs = null;
+        try {
+            // 获取字段信息
+            rs = connection.getMetaData().getColumns(null, jdbcInfo.getSchema(), jdbcInfo.getTableName(), null);
+            while (rs.next()) {
+                // 表类别（可能为空）
+                String tableCat = rs.getString("TABLE_CAT");
+                //表模式（可能为空）,在oracle中获取的是命名空间,其它数据库未知
+                String tableSchemaName = rs.getString("TABLE_SCHEM");
+                //表名
+                String tableName_ = rs.getString("TABLE_NAME");
+                //列名
+                String columnName = rs.getString("COLUMN_NAME");
+                //对应的java.sql.Types的SQL类型(列类型ID)
+                int dataType = rs.getInt("DATA_TYPE");
+                //java.sql.Types类型名称(列类型名称)
+                String dataTypeName = rs.getString("TYPE_NAME");
+                //列大小
+                int columnSize = rs.getInt("COLUMN_SIZE");
+                //小数位数
+                int decimalDigits = rs.getInt("DECIMAL_DIGITS");
+                //基数（通常是10或2） --未知
+                int numPrecRadix = rs.getInt("NUM_PREC_RADIX");
+                /**
+                 *  0 (columnNoNulls) - 该列不允许为空
+                 *  1 (columnNullable) - 该列允许为空
+                 *  2 (columnNullableUnknown) - 不确定该列是否为空
+                 */
+                int nullAble = rs.getInt("NULLABLE");
+                String canNull = 1 == nullAble ? "" : " NOT NULL";
+                //列描述
+                String remarks = rs.getString("REMARKS");
+                String comment = remarks == null ? "" : " COMMENT \"" + remarks + "\"";
+                //默认值
+                String columnDef = rs.getString("COLUMN_DEF");
+                String defaultVal = columnDef == null ? "" : " DEFAULT " + columnDef;
+                // 对于 char 类型，该长度是列中的最大字节数
+                int charOctetLength = rs.getInt("CHAR_OCTET_LENGTH");
+                //表中列的索引（从1开始）
+                int ordinalPosition = rs.getInt("ORDINAL_POSITION");
+                /**
+                 * ISO规则用来确定某一列的是否可为空(等同于NULLABLE的值:[ 0:'YES'; 1:'NO'; 2:''; ])
+                 * YES -- 该列可以有空值;
+                 * NO -- 该列不能为空;
+                 * 空字符串--- 不知道该列是否可为空
+                 */
+                String isNullAble = rs.getString("IS_NULLABLE");
+
+                /**
+                 * 指示此列是否是自动递增
+                 * YES -- 该列是自动递增的
+                 * NO -- 该列不是自动递增
+                 * 空字串--- 不能确定该列是否自动递增
+                 */
+                String AutoIncrement = "";
+                try {
+                    String isAutoincrement = rs.getString("IS_AUTOINCREMENT");
+                    AutoIncrement = isAutoincrement.equalsIgnoreCase("YES") ? " AUTO_INCREMENT" : "";
+                }catch (Exception e){
+                    log.info("{}", "无法判断字段是否自增");
+                }
+                // 构建单条创建列字段语句
+                StringBuilder sb = new StringBuilder();
+
+                sb.append(columnName).append(" ");  // example: id
+                // 特殊情况进行处理
+                if (map.get(dataTypeName.toUpperCase(Locale.ROOT)) == null){
+                    sb.append("TEXT");
+                }else {
+                    String mysqlDataType = map.get(dataTypeName.toUpperCase(Locale.ROOT));
+                    if (mysqlDataType.equalsIgnoreCase("datetime")) {
+                        sb.append(mysqlDataType); // id INT
+                    }else{
+                        sb.append(mysqlDataType).append("(").append(columnSize).append(")"); // id INT(10)
+                    }
+                }
+                sb
+                        .append(pks.contains(columnName) ? " PRIMARY KEY" : "") // id INT(10) PRIMARY KEY
+                        .append(AutoIncrement) // id INT(10) PRIMARY KEY AUTO_INCREMENT
+                        .append(canNull) // id INT(10) PRIMARY KEY AUTO_INCREMENT NOT NULL
+                        .append(defaultVal)
+                        .append(comment);
+                columnList.add(sb.toString());
+            }
+        } catch (SQLException e) {
+            log.error("{}——{}", "列元数据获取异常", e.getMessage());
+        }finally {
+            if (rs != null){
+                try {
+                    rs.close();
+                } catch (SQLException e) {
+                    log.error("{}——{}", "列Rs关闭异常", e.getMessage());
+                }
+            }
+        }
+        return columnList;
+    }
+
+
+    /**
+
+     * Returns a DataSource object for connection to the database.
+
+     *
+
+     * @return a DataSource.
+
+     */
+    private static DataSource getDataSource(JDBCInfo jdbcInfo) {
+
+        // 创建DriverManagerDataSource的新实例并进行设置
+
+        // 必需的参数，例如Jdbc Driver类，
+
+        // Jdbc URL，数据库用户名和密码。
+
+        DriverManagerDataSource dataSource = new DriverManagerDataSource();
+
+        dataSource.setDriverClassName(jdbcInfo.getDriverClassName());
+
+        dataSource.setUrl(jdbcInfo.getUrl());
+
+        dataSource.setUsername(jdbcInfo.getUser());
+
+        dataSource.setPassword(jdbcInfo.getPassword());
+
+        return dataSource;
+
+    }
+
+
+    /**
+     * 在本系统的MySQL中是否存在表
+     *
+     * @param tableName 表名
+     * @return boolean
+     */
+    public boolean isExistTable(String tableName) {
+        JDBCInfo jdbcInfo = new JDBCInfo();
+        jdbcInfo.setUrl(sysUrl);
+        jdbcInfo.setDriverClassName(sysDriver);
+        jdbcInfo.setUser(sysUsername);
+        jdbcInfo.setPassword(sysPassword);
+
+        DataSource dataSource = getDataSource(jdbcInfo);
+        JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
+
+        String sql = " SELECT COUNT(1) as count FROM information_schema.TABLES \n" +
+                " WHERE table_name = ? and TABLE_SCHEMA = (select database())";
+
+        Map<String, Object> map = jdbcTemplate.queryForMap(sql, tableName);
+        Long count = (Long) map.get("count");
+        if (count == 0L){
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 全量更新数据
+     *
+     * @param jdbcInfo jdbc信息
+     */
+    public void transferAllData(JDBCInfo jdbcInfo) {
+        DataSource dataSource = getDataSource(jdbcInfo);
+        JdbcTemplate jdbcTemplate = new JdbcTemplate(dataSource);
+
+        // 查询源表数据
+        String selectSql = "SELECT * FROM " + jdbcInfo.getSchema() + "." +jdbcInfo.getTableName();
+        List<Map<String, Object>> selectResListMap = jdbcTemplate.queryForList(selectSql);
+
+        // 判断需要有多少个占位符
+        if (selectResListMap.size() == 0){
+            log.info("{}", "源表数据为空");
+            return;
+        }
+        Map<String, Object> map = selectResListMap.get(0);
+        // 存储到本系统
+        String saveSql = "REPLACE INTO " + jdbcInfo.getTableName() + " values(";
+        ParamAndSql pas = createSaveSql(saveSql, selectResListMap);
+
+        DataSource localDataSource = getLocalDataSource();
+        JdbcTemplate localJdbcTemplate = new JdbcTemplate(localDataSource);
+        localJdbcTemplate.batchUpdate(pas.getSql(), pas.getParam());
+
+    }
+
+
+    /**
+     * 获取本系统数据源 即yml配置
+     *
+     * @return {@link DataSource}
+     */
+    private DataSource getLocalDataSource() {
+        JDBCInfo jdbcInfo = new JDBCInfo();
+        jdbcInfo.setUrl(sysUrl);
+        jdbcInfo.setDriverClassName(sysDriver);
+        jdbcInfo.setUser(sysUsername);
+        jdbcInfo.setPassword(sysPassword);
+        return getDataSource(jdbcInfo);
+    }
+
+
+    /**
+     * 创建保存sql
+     *
+     * @param saveSql 保存sql
+     * <p>
+     *  REPLACE INTO TableName values(
+     * </p>
+     * @param inData  数据
+     * @return {@link ParamAndSql}
+     */
+    private ParamAndSql createSaveSql(String saveSql, List<Map<String, Object>> inData) {
+
+        List<Object[]> objectsList = new LinkedList<>();
+
+        int size = 0;
+        for (Map<String, Object>map:
+                inData) {
+            Set<Map.Entry<String, Object>> entries = map.entrySet();
+            List<Object> objects = new LinkedList<>();
+            for (Map.Entry<String, Object> item:
+                    entries) {
+                size =  size == 0 ? entries.size():size;
+                objects.add(item.getValue());
+            }
+            objectsList.add(objects.toArray());
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append(saveSql);
+        for (int i = 0; i < size; i++) {
+            sb.append("?,");
+        }
+        sb.delete(sb.lastIndexOf(","), sb.length()).append(")");
+
+        ParamAndSql paramAndSql = new ParamAndSql();
+        paramAndSql.setSql(sb.toString());
+        paramAndSql.setParam(objectsList);
+        return paramAndSql;
+    }
+
+    /**
+     * 创建jdbc信息, 无用户、密码
+     * @param jdbcVO jdbc签证官
+     * @return {@link JDBCInfo}
+     */
+    public JDBCInfo createJdbcInfo(JdbcVO jdbcVO) {
+        JDBCInfo jdbcInfo = new JDBCInfo();
+        jdbcInfo.setType(jdbcVO.getDbType());
+        jdbcInfo.setSchema(jdbcVO.getSchema());
+        jdbcInfo.setDatabase(jdbcVO.getDatabase());
+        jdbcInfo.setTableName(jdbcVO.getTableName());
+
+        // 创建URL、Driver
+        if (jdbcInfo.getType().equalsIgnoreCase("mysql")) {
+            jdbcInfo.setDriverClassName("com.mysql.cj.jdbc.Driver");
+            jdbcInfo.setTableName(jdbcVO.getTableName());
+            jdbcInfo.setSchema(jdbcVO.getSchema());
+            jdbcInfo.setUrl("jdbc:mysql://" + jdbcVO.getHost() + ":" + jdbcVO.getPort() + "/" + jdbcVO.getSchema() + "?serverTimezone=Asia/Shanghai");
+        }else if (jdbcInfo.getType().equalsIgnoreCase("pg")){
+            jdbcInfo.setDriverClassName("org.postgresql.Driver");
+            StringBuilder stringBuilder = new StringBuilder("jdbc:postgresql://");
+            stringBuilder.append(jdbcVO.getHost()).append(":").append(jdbcVO.getPort()).append("/")
+                    .append(jdbcVO.getDatabase());
+            jdbcInfo.setUrl(stringBuilder.toString());
+        }else if (jdbcInfo.getType().equalsIgnoreCase("hive")){
+            jdbcInfo.setDriverClassName("org.apache.hive.jdbc.HiveDriver");
+            StringBuilder stringBuilder = new StringBuilder("jdbc:hive2://");
+            stringBuilder.append(jdbcVO.getHost()).append(":").append(jdbcVO.getPort()).append("/")
+                    .append(jdbcVO.getDatabase());
+            jdbcInfo.setUrl(stringBuilder.toString());
+        }
+        return jdbcInfo;
+    }
+
+    /**
+     * 参数和sql
+     *
+     * @author Brian Sun
+     * @date 2022/09/21
+     */
+    @Data
+    public static class ParamAndSql implements Serializable {
+        private String sql;
+        private List<Object[]> param;
+    }
+
+
+    /**
+     * 生成主机映射
+     *
+     * @return {@link Map}<{@link String}, {@link List}<{@link JdbcParseUser}>>
+     */
+    private Map<String, List<JdbcParseUser>> generateHostMap(){
+        ClassLoader classLoader = ScdlApplication.class.getClassLoader();
+        URL resource = classLoader.getResource(DB_USER_PASS_FILENAME);
+
+        // 1、获取jdbc-user-password.json
+        String jsonString = "";
+        try {
+            Path path = Paths.get(resource.toURI());
+            List<String> fileString = Files.readAllLines(path);
+            StringBuilder sb = new StringBuilder();
+            for (String s:
+                    fileString) {
+                sb.append(s);
+            }
+            jsonString = sb.toString();
+        } catch (IOException | URISyntaxException e) {
+            log.error("{}——{}", "文件读取异常", e.getMessage());
+            // TODO 抛异常
+        }
+
+        if (com.yeexun.scdl.common.utils.StringUtils.isEmpty(jsonString)){
+            log.error("{}", "添加失败，配置信息为空或未找到配置信息");
+            // TODO 抛异常
+        }
+        // 2、转实体
+        List<JdbcParseUser> jdbcParseUsers = JSONObject.parseArray(jsonString, JdbcParseUser.class);
+        // 3、根据host形成 map
+        Map<String, List<JdbcParseUser>> hostMap =
+                jdbcParseUsers.stream().collect(Collectors.groupingBy(JdbcParseUser::getHostPort));
+        return hostMap;
+    }
+
+
+    /**
+     * 根据用户所传schema，获取配置文件中该schema的账户密码
+     *
+     * @param schemaList schema列表
+     * @param database   数据库
+     * @return {@link Map}<{@link String}, {@link String}>
+     */
+    private Map<String, String> getDatabaseUser(List<JdbcParseUser.DatabaseList> schemaList, String database) {
+        Map<String, List<JdbcParseUser.DatabaseList>> schemaMap =
+                schemaList.stream().filter(item-> org.apache.commons.lang3.StringUtils.isNotBlank(item.getDatabase()))
+                        .collect(Collectors.groupingBy(JdbcParseUser.DatabaseList::getDatabase));
+        // 获取该database下的信息
+        List<JdbcParseUser.DatabaseList> databaseList = schemaMap.get(database);
+        if (database != null && databaseList.size() != 0){
+            Map<String, String> map = new HashMap<>(2);
+            JdbcParseUser.DatabaseList databaseList1 = databaseList.get(0);
+            String username = databaseList1.getUser();
+            String password = databaseList1.getPassword();
+            map.put("username", username);
+            map.put("password", password);
+            return map;
+        }
+        return null;
+    }
+}
