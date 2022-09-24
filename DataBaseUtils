@@ -2,11 +2,7 @@ import cn.hutool.core.date.DateTime;
 import cn.hutool.core.date.DateUtil;
 import com.alibaba.druid.util.JdbcUtils;
 import com.alibaba.fastjson.JSONObject;
-import com.yeexun.scdl.ScdlApplication;
-import com.yeexun.scdl.common.bean.BeanUtils;
-import com.yeexun.scdl.entity.scan.JDBCInfo;
-import com.yeexun.scdl.entity.scan.JdbcParseUser;
-import com.yeexun.scdl.entity.scan.JdbcVO;
+
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,7 +24,7 @@ import java.util.Date;
 import java.util.stream.Collectors;
 
 /**
- * 数据库迁移工具
+ * 扫描配置数据库迁移工具
  *
  * @author Brian
  * @date 2022/9/19 3:58 PM
